@@ -2,7 +2,14 @@ import unittest
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 
-from polyglot_map.cli import Target, map_target_path, parse_languages, resolve_target_path, snake_case
+from polyglot_map.cli import (
+    Target,
+    load_prompt_template,
+    map_target_path,
+    parse_languages,
+    resolve_target_path,
+    snake_case,
+)
 
 
 class LayoutMappingTests(unittest.TestCase):
@@ -14,6 +21,15 @@ class LayoutMappingTests(unittest.TestCase):
 
     def test_parse_languages_normalizes_aliases_and_dedupes(self) -> None:
         self.assertEqual(parse_languages(["ts,python,golang", "go"]), ("typescript", "python", "go"))
+
+    def test_prompt_template_is_external_and_complete(self) -> None:
+        template = load_prompt_template()
+
+        self.assertIn("You are Polyglot Drift Mapper", template)
+        self.assertIn("Hard invariants:", template)
+        self.assertIn("Additional layout rules:", template)
+        self.assertIn("{manifest_text}", template)
+        self.assertIn("{selected_languages}", template)
 
     def test_default_implementation_mapping(self) -> None:
         rel = PurePosixPath("src/EventBus.ts")

@@ -117,6 +117,12 @@ polyglot-map run --languages ts,python,golang
 
 Aliases include `ts`, `typescript`, `py`, `python`, `go`, `golang`, `rs`, `rust`, `rb`, and `ruby`.
 
+## Prompt Template
+
+The full agent prompt lives in `src/polyglot_map/system_prompt.md`.
+
+The CLI hydrates that template with invocation-specific values such as configured languages, repository roots, discovered `AGENTS.md` content, and the JSON source manifest. Edit the Markdown file to change policy; keep Python changes focused on discovery and rendering.
+
 ## Safety Model
 
 The generated system prompt forbids destructive git commands, silent test downgrades, TODO placeholders for mapped files, compatibility shims that hide drift, and rename-only layout churn.
