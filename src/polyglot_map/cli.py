@@ -1,0 +1,735 @@
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import fnmatch
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path, PurePosixPath
+from typing import Iterable
+
+
+DEFAULT_REPO = Path.cwd()
+DEFAULT_AGENT_PATTERNS = ("AGENTS.md", "*/AGENTS.md")
+SOURCE_LANGUAGES = ("typescript",)
+TARGET_LANGUAGES = ("python", "go", "rust", "ruby")
+TARGET_EXTENSIONS = {
+    "python": (".py",),
+    "go": (".go",),
+    "rust": (".rs",),
+    "ruby": (".rb",),
+}
+LANGUAGE_ALIASES = {
+    "py": "python",
+    "python": "python",
+    "go": "go",
+    "golang": "go",
+    "rs": "rust",
+    "rust": "rust",
+    "rb": "ruby",
+    "ruby": "ruby",
+    "ts": "typescript",
+    "tsx": "typescript",
+    "typescript": "typescript",
+}
+SOURCE_EXTENSIONS = (".ts", ".tsx", ".mts", ".cts")
+IGNORED_DIRS = {
+    ".git",
+    ".next",
+    ".turbo",
+    ".venv",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "target",
+}
+IGNORED_GLOBS = ("*.d.ts", "*.map", "*.min.ts")
+INITIALISM_NORMALIZATIONS = {
+    "HTTP": "Http",
+    "JSONL": "Jsonl",
+    "NATS": "Nats",
+    "OTel": "Otel",
+    "SQLite": "Sqlite",
+    "SQL": "Sql",
+}
+
+
+STRICT_SYSTEM_PROMPT = """You are Polyglot Drift Mapper, a non-interactive implementation repair agent.
+
+Mission:
+- TypeScript is the canonical source. The configured language set defines the target implementations.
+- Bring every configured target implementation, test, fixture, and example back into exact semantic parity with the TypeScript source.
+- Preserve all user work already in the tree. Never reset, revert, delete, or overwrite unrelated edits.
+
+Hard invariants:
+- Public API parity is mandatory: identical exported names, method names, function signatures, constructor shape, option fields, event names, return shapes, error behavior, async/sync behavior, timeout behavior, default values, and serialization semantics.
+- Type parity is mandatory: represent TypeScript unions, generics, optional values, nullability, maps, lists, records, callbacks, promises, async iterables, and discriminated variants with the strongest equivalent each target language supports.
+- Layout parity is mandatory, but existing target layout is authoritative. Every TypeScript implementation/test/example file must have an equivalent target file; if an equivalent target file already exists under the target language's established casing or package idiom, update it in place.
+- Generated mapped paths are for missing files only. Do not rename, move, split, merge, or delete existing target files just to satisfy a different casing transform, package layout, or aesthetic preference.
+- Test parity is mandatory: every TypeScript test scenario must exist in each target language unless the target runtime cannot express it. If a runtime cannot express it, write the closest executable assertion and document the exact limitation in a short code comment.
+- Behavior parity beats idiom. Do not simplify or "improve" semantics in one language unless the same change is present in TypeScript and all other targets.
+- Naming parity is strict. Keep public class/function/type/constant names verbatim with TypeScript where the target language permits it. Use the target language's idiomatic casing only where verbatim names are illegal, ambiguous, or conflict with an existing package convention.
+- Apply casing transforms by category, not by blanket normalization: public callable/type names preserve TypeScript names when legal; fields, locals, config keys, fixture data, JSON/event payload values, and non-callable values use snake_case; filenames/modules follow the target repo's established idiom and may preserve the TypeScript source stem for class-like files.
+- Use snake_case for all field names, local variables, config keys, fixture values, JSON/event payload values, and non-callable values. Callable names may follow the target language's public API convention only when required by the language or existing package surface.
+- Keep constructor parameters, options objects, keyword arguments, struct fields, dataclass/model fields, and test fixture fields in the same order across languages.
+- Keep comments/docstrings only when they explain non-obvious parity constraints or runtime limitations.
+- Never create compatibility aliases, legacy shims, dead wrappers, or one-line helpers just to hide drift.
+
+Cross-language architecture:
+- Keep one owning module/object per responsibility. Do not add wrapper layers, generic managers, aliases, facades, stale adapters, or compatibility shims when direct use of the owning object is clearer.
+- Shared dependency versions and generated schemas/types must stay type-identical across language packages. Update root/workspace manifests instead of creating nested lockfiles or isolated installs.
+- Use the one correct path plainly. Do not implement fallback chains, multi-attempt guessing paths, custom retry frameworks, custom timeout frameworks, custom lock frameworks, or custom semaphore frameworks unless the TypeScript source already owns that behavior.
+- Event-driven libraries must keep side effects event-first: dispatch through the public event/bus/client surface, read completion results or event history, and preserve parent-child relationships. Do not bypass the owning layer with direct low-level calls.
+- Durable or derivable state must not live in static maps, hidden arrays, or private caches. Private state is only for live handles, transport internals, timers, queues, and non-serializable lifecycle state.
+- Serialization parity must be explicit. Do not force-normalize objects with stringify/parse round trips or lossy ad hoc conversions.
+
+Tooling expectations:
+- Use pnpm for TypeScript/Node commands.
+- Use uv and uv run for Python commands when Python is selected.
+- Use go test and gofmt for Go commands when Go is selected.
+- Use cargo test and cargo fmt for Rust commands when Rust is selected.
+- Use bundle exec/ruby-native commands for Ruby when Ruby is selected and a Ruby package exists.
+- Do not add nested package lockfiles, independent package installs, or vendored copies of published dependencies unless the source repo already does so.
+
+Workflow:
+1. Read the repository guidance and AGENTS.md content included below before editing.
+2. Inspect the TypeScript source files in the source manifest and compare them to every mapped target file.
+3. Update missing or drifted target files in every configured target language.
+4. Keep package exports, module indexes, manifests, and build metadata in sync when new files are added.
+5. Run the most focused real tests/type checks available for changed target languages. Do not mock unavailable behavior.
+6. If a configured target language package does not exist yet, create the minimal package layout needed for the mapped files and tests, following the same strict parity rules.
+7. After edits, run a drift pass: search for stale names, duplicate types, shallow tests, fallback paths, direct side-effect calls, unused code, and missing mapped files.
+
+Forbidden:
+- Do not modify TypeScript source unless the prompt explicitly asks for source fixes.
+- Do not skip a language because the current repo has no package yet.
+- Do not leave TODO placeholders for mapped implementation or tests.
+- Do not silently drop tests, error paths, edge cases, optional dependency handling, concurrency behavior, or timing behavior.
+- Do not rename a public symbol just because a target language style guide prefers a different name.
+- Do not rename or move an existing file just because a generated mapping suggests a different casing or package path. Preserve established target-language homes for behavior, including PascalCase class modules and idiomatic command entrypoints, when they correspond to the TypeScript source.
+- Do not skip, return early, downgrade assertions, or silently pass because of missing environment, credentials, services, browsers, package managers, or binaries. Let tests hard-fail so the environment or implementation can be fixed.
+- Do not mock, fake, simulate, monkey-patch, or stub user-facing behavior, external clients, event handlers, browser/runtime behavior, transport behavior, package installers, or layer internals.
+- Do not use shallow attribute-presence assertions. Assert exact values, emitted events, completion results, parent-child event relationships, side effects, writes, serialized shapes, and real runtime state.
+- Do not run destructive git commands or use git worktrees.
+"""
+
+
+@dataclasses.dataclass(frozen=True)
+class Target:
+    language: str
+    root: Path
+    package_name: str = "package"
+
+
+@dataclasses.dataclass(frozen=True)
+class HarnessConfig:
+    repo: Path
+    source_root: Path
+    targets: tuple[Target, ...]
+    agent_patterns: tuple[str, ...]
+
+
+def default_package_name(repo: Path) -> str:
+    return snake_case(repo.name.replace("-", "_")) or "package"
+
+
+def normalize_language(language: str) -> str:
+    normalized = language.strip().lower().replace("_", "-")
+    if normalized not in LANGUAGE_ALIASES:
+        expected = ", ".join(sorted(LANGUAGE_ALIASES))
+        raise argparse.ArgumentTypeError(f"unsupported language {language!r}; expected one of {expected}")
+    return LANGUAGE_ALIASES[normalized]
+
+
+def parse_languages(values: Iterable[str] | None) -> tuple[str, ...]:
+    if not values:
+        return ()
+    languages: list[str] = []
+    for value in values:
+        for language in value.split(","):
+            if language.strip():
+                languages.append(normalize_language(language))
+    return tuple(dict.fromkeys(languages))
+
+
+def snake_case(name: str) -> str:
+    name = name.strip()
+    for initialism, normalized in INITIALISM_NORMALIZATIONS.items():
+        name = name.replace(initialism, normalized)
+    name = re.sub(r"[\s\-]+", "_", name)
+    name = name.replace(".", "_")
+    name = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    name = re.sub(r"_+", "_", name)
+    return name.strip("_").lower() or "index"
+
+
+def remove_ts_suffix(path: PurePosixPath) -> str:
+    name = path.name
+    for suffix in SOURCE_EXTENSIONS:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return path.stem
+
+
+def is_source_path(path: Path) -> bool:
+    if path.suffix not in SOURCE_EXTENSIONS:
+        return False
+    name = path.name
+    if any(fnmatch.fnmatch(name, pattern) for pattern in IGNORED_GLOBS):
+        return False
+    return not any(part in IGNORED_DIRS for part in path.parts)
+
+
+def is_source_file(path: Path) -> bool:
+    return path.is_file() and is_source_path(path)
+
+
+def iter_source_files(source_root: Path) -> list[Path]:
+    if not source_root.exists():
+        return []
+    found: list[Path] = []
+    for root, dirs, files in os.walk(source_root):
+        dirs[:] = [dirname for dirname in dirs if dirname not in IGNORED_DIRS]
+        root_path = Path(root)
+        for filename in files:
+            path = root_path / filename
+            if is_source_file(path):
+                found.append(path)
+    return sorted(found)
+
+
+def normalize_source_rel(source_root: Path, path: Path) -> PurePosixPath:
+    try:
+        return PurePosixPath(path.resolve().relative_to(source_root.resolve()).as_posix())
+    except ValueError:
+        return PurePosixPath(path.as_posix())
+
+
+def is_test_rel(rel: PurePosixPath) -> bool:
+    stem = remove_ts_suffix(rel)
+    return "tests" in rel.parts or stem.startswith("test.") or stem.endswith(".test") or stem.endswith("_test")
+
+
+def source_kind(rel: PurePosixPath) -> str:
+    if rel.parts and rel.parts[0] == "examples":
+        return "example"
+    if is_test_rel(rel):
+        return "test"
+    return "implementation"
+
+
+def canonical_test_name(rel: PurePosixPath, *, preserve_test_dot_name: bool = False) -> str:
+    stem = remove_ts_suffix(rel)
+    if stem.startswith("test."):
+        name = stem.removeprefix("test.")
+        return name if preserve_test_dot_name else f"test_{snake_case(name)}"
+    if stem.endswith(".test"):
+        return f"test_{snake_case(stem.removesuffix('.test'))}"
+    if stem.endswith("_test"):
+        return f"test_{snake_case(stem.removesuffix('_test'))}"
+    return f"test_{snake_case(stem)}"
+
+
+def path_without_source_prefix(rel: PurePosixPath) -> tuple[str, ...]:
+    parts = tuple(rel.parts)
+    if parts and parts[0] in {"src", "tests", "examples"}:
+        return parts[1:]
+    return parts
+
+
+def implementation_parts(rel: PurePosixPath) -> tuple[str, ...]:
+    parts = path_without_source_prefix(rel)
+    return parts[:-1]
+
+
+def embedded_test_dirs(rel: PurePosixPath) -> tuple[str, ...]:
+    parts = path_without_source_prefix(rel)
+    if "tests" not in parts:
+        return parts[:-1]
+    test_index = parts.index("tests")
+    return parts[:test_index] + parts[test_index + 1 : -1]
+
+
+def map_target_path(rel: PurePosixPath, target: Target) -> Path:
+    kind = source_kind(rel)
+    stem = remove_ts_suffix(rel)
+    root = target.root
+    implementation_dir = Path(*map(snake_case, implementation_parts(rel)))
+    test_dir = Path(*map(snake_case, embedded_test_dirs(rel)))
+
+    if target.language == "python":
+        if kind == "implementation":
+            filename = "__init__.py" if stem == "index" else f"{snake_case(stem)}.py"
+            return root / target.package_name / implementation_dir / filename
+        if kind == "example":
+            return root / "examples" / implementation_dir / f"{snake_case(stem)}.py"
+        return root / "tests" / test_dir / f"{canonical_test_name(rel)}.py"
+
+    if target.language == "go":
+        if kind == "implementation":
+            return root / implementation_dir / f"{snake_case(stem)}.go"
+        if kind == "example":
+            return root / "examples" / implementation_dir / f"{snake_case(stem)}.go"
+        if remove_ts_suffix(rel).startswith("test."):
+            filename = f"{canonical_test_name(rel, preserve_test_dot_name=True)}_test.go"
+            return root / test_dir / filename
+        filename = f"{snake_case(canonical_test_name(rel).removeprefix('test_'))}_test.go"
+        return root / "tests" / test_dir / filename
+
+    if target.language == "rust":
+        if kind == "implementation":
+            filename = "lib.rs" if stem == "index" else f"{snake_case(stem)}.rs"
+            return root / "src" / implementation_dir / filename
+        if kind == "example":
+            return root / "examples" / implementation_dir / f"{snake_case(stem)}.rs"
+        return root / "tests" / test_dir / f"{canonical_test_name(rel)}.rs"
+
+    if target.language == "ruby":
+        if kind == "implementation":
+            filename = f"{target.package_name}.rb" if stem == "index" else f"{snake_case(stem)}.rb"
+            return root / "lib" / target.package_name / implementation_dir / filename
+        if kind == "example":
+            return root / "examples" / implementation_dir / f"{snake_case(stem)}.rb"
+        return root / "test" / test_dir / f"{canonical_test_name(rel)}.rb"
+
+    raise ValueError(f"unsupported target language: {target.language}")
+
+
+def target_stem_keys(rel: PurePosixPath) -> set[str]:
+    stem = remove_ts_suffix(rel)
+    if stem.startswith("test."):
+        base = stem.removeprefix("test.")
+    elif stem.endswith(".test"):
+        base = stem.removesuffix(".test")
+    elif stem.endswith("_test"):
+        base = stem.removesuffix("_test")
+    else:
+        base = stem
+
+    base_key = snake_case(base)
+    stem_key = snake_case(stem)
+    keys = {base_key, stem_key, f"test_{base_key}", f"{base_key}_test"}
+    if stem == "index":
+        keys.add("__init__")
+    return keys
+
+
+def candidate_target_key(path: Path) -> str:
+    if path.name == "main.go":
+        return snake_case(path.parent.name)
+    return snake_case(path.stem)
+
+
+def target_candidate_score(path: Path, default_path: Path) -> tuple[int, int, str]:
+    if path == default_path:
+        return (0, len(path.parts), path.as_posix())
+    if path.name == default_path.name:
+        return (10, len(path.parts), path.as_posix())
+    if path.parent == default_path.parent:
+        return (20, len(path.parts), path.as_posix())
+    return (30, len(path.parts), path.as_posix())
+
+
+def resolve_target_path(rel: PurePosixPath, target: Target) -> tuple[Path, str, Path | None]:
+    default_path = map_target_path(rel, target)
+    if default_path.exists():
+        return default_path, "mapped-existing", None
+
+    root = target.root
+    suffixes = TARGET_EXTENSIONS[target.language]
+    keys = target_stem_keys(rel)
+    if root.exists():
+        candidates = [
+            path
+            for path in root.rglob("*")
+            if path.is_file()
+            and path.suffix in suffixes
+            and not any(part in IGNORED_DIRS for part in path.parts)
+            and candidate_target_key(path) in keys
+        ]
+        if candidates:
+            return sorted(candidates, key=lambda path: target_candidate_score(path, default_path))[0], "existing-equivalent", default_path
+
+    return default_path, "generated-missing", None
+
+
+def default_config(repo: Path = DEFAULT_REPO, agent_patterns: tuple[str, ...] = DEFAULT_AGENT_PATTERNS) -> HarnessConfig:
+    repo = repo.expanduser().resolve()
+    package_name = default_package_name(repo)
+    return HarnessConfig(
+        repo=repo,
+        source_root=repo,
+        targets=(
+            Target("python", repo / "python", package_name),
+            Target("go", repo / "go", package_name),
+            Target("rust", repo / "rust", package_name),
+            Target("ruby", repo / "ruby", package_name),
+        ),
+        agent_patterns=agent_patterns,
+    )
+
+
+def parse_target(value: str) -> Target:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("targets must be formatted as language=/absolute/or/relative/path")
+    language, raw_path = value.split("=", 1)
+    language = normalize_language(language)
+    if language in SOURCE_LANGUAGES:
+        raise argparse.ArgumentTypeError("TypeScript is the source language and cannot be used as a target")
+    return Target(language, Path(raw_path).expanduser().resolve())
+
+
+def config_from_args(args: argparse.Namespace) -> HarnessConfig:
+    agent_patterns = tuple(args.agents_glob) if args.agents_glob else DEFAULT_AGENT_PATTERNS
+    config = default_config(Path(args.repo), agent_patterns)
+    source_root = Path(args.source_root).expanduser().resolve() if args.source_root else config.source_root
+    package_name = args.package_name or default_package_name(config.repo)
+    if args.target:
+        targets = tuple(dataclasses.replace(target, package_name=package_name) for target in args.target)
+    else:
+        targets = tuple(dataclasses.replace(target, package_name=package_name) for target in config.targets)
+    selected_languages = parse_languages(args.languages or args.only)
+    if selected_languages:
+        selected_targets = {language for language in selected_languages if language in TARGET_LANGUAGES}
+        targets = tuple(target for target in targets if target.language in selected_targets)
+    return HarnessConfig(repo=config.repo, source_root=source_root, targets=targets, agent_patterns=config.agent_patterns)
+
+
+def read_agents(repo: Path, patterns: Iterable[str]) -> tuple[list[Path], list[str], str]:
+    paths: list[Path] = []
+    unmatched: list[str] = []
+    for raw_pattern in patterns:
+        pattern_path = Path(raw_pattern).expanduser()
+        pattern = str(pattern_path if pattern_path.is_absolute() else repo / pattern_path)
+        matches = [
+            match
+            for match in sorted(glob.glob(pattern, recursive=True))
+            if Path(match).is_file() and not any(part in IGNORED_DIRS for part in Path(match).parts)
+        ]
+        if matches:
+            paths.extend(Path(path) for path in matches)
+        else:
+            unmatched.append(raw_pattern)
+    paths = sorted({path.resolve(): path.resolve() for path in paths}.values())
+    chunks: list[str] = []
+    for path in paths:
+        try:
+            text = path.read_text()
+        except OSError as err:
+            text = f"[unreadable: {err}]"
+        chunks.append(f"--- {path} ---\n{text.rstrip()}\n")
+    return paths, unmatched, "\n".join(chunks).rstrip()
+
+
+def changed_source_files(config: HarnessConfig, raw_paths: Iterable[str]) -> list[Path]:
+    paths: list[Path] = []
+    for raw_path in raw_paths:
+        raw = Path(raw_path).expanduser()
+        raw_candidates = [raw] if raw.is_absolute() else [Path.cwd() / raw, config.repo / raw, config.source_root / raw]
+        candidates = [candidate.resolve() for candidate in raw_candidates]
+        for path in candidates:
+            if path.exists() and is_source_path(path):
+                paths.append(path)
+                break
+        else:
+            for path in candidates:
+                if is_source_path(path):
+                    paths.append(path)
+                    break
+    unique = {path.resolve(): path.resolve() for path in paths}
+    return sorted(unique.values())
+
+
+def build_manifest(config: HarnessConfig, source_files: list[Path]) -> list[dict[str, object]]:
+    manifest: list[dict[str, object]] = []
+    for path in source_files:
+        rel = normalize_source_rel(config.source_root, path)
+        target_paths: dict[str, str] = {}
+        default_target_paths: dict[str, str] = {}
+        target_path_sources: dict[str, str] = {}
+        for target in config.targets:
+            target_path, source, default_path = resolve_target_path(rel, target)
+            target_paths[target.language] = str(target_path)
+            target_path_sources[target.language] = source
+            if default_path is not None:
+                default_target_paths[target.language] = str(default_path)
+        manifest.append(
+            {
+                "source": str(path),
+                "source_rel": rel.as_posix(),
+                "source_exists": path.exists(),
+                "kind": source_kind(rel),
+                "targets": target_paths,
+                "target_path_sources": target_path_sources,
+                "generated_default_targets": default_target_paths,
+            }
+        )
+    return manifest
+
+
+def build_prompt(config: HarnessConfig, source_files: list[Path], *, mode: str) -> str:
+    agent_paths, unmatched_agent_patterns, agent_text = read_agents(config.repo, config.agent_patterns)
+    manifest = build_manifest(config, source_files)
+    selected_languages = ", ".join(("typescript", *(target.language for target in config.targets)))
+    target_summary = "\n".join(f"- {target.language}: {target.root}" for target in config.targets)
+    agent_summary = "\n".join(f"- {path}" for path in agent_paths) if agent_paths else "- no AGENTS.md files matched"
+    unmatched_agent_summary = "\n".join(f"- {pattern}" for pattern in unmatched_agent_patterns)
+    manifest_text = json.dumps(manifest, indent=2)
+
+    return f"""{STRICT_SYSTEM_PROMPT}
+
+Invocation mode: {mode}
+
+Configured languages:
+{selected_languages}
+
+Repository root:
+{config.repo}
+
+TypeScript source root:
+{config.source_root}
+
+Target roots:
+{target_summary or "- none configured; this invocation can only inspect TypeScript source"}
+
+AGENTS.md patterns:
+{chr(10).join(f"- {pattern}" for pattern in config.agent_patterns)}
+
+AGENTS.md files read:
+{agent_summary}
+
+AGENTS.md patterns not matched:
+{unmatched_agent_summary or "- all patterns matched"}
+
+Repository guidance:
+{agent_text or "[No AGENTS.md content was found for this invocation.]"}
+
+Mapped source manifest:
+```json
+{manifest_text}
+```
+
+Additional layout rules:
+- Treat each source_rel entry as canonical.
+- Use the targets map as the path contract for every target language in this run.
+- The target_path_sources map explains why each target path was selected: mapped-existing means the generated path already exists, existing-equivalent means an established target file was found and must be preserved, and generated-missing means no equivalent file exists yet.
+- generated_default_targets are informational only. Do not create, rename, move, or delete files to reach those defaults when targets already points at an existing-equivalent file.
+- If a generated-missing target file is missing, create it at the targets path.
+- If source_exists is false, remove or retire only the target files listed in targets and update package exports unless another TypeScript source still owns that target.
+- If package export files are needed for a mapped implementation file, update them.
+- Root-level TypeScript tests map to each target language's normal top-level test location.
+- TypeScript tests nested under src/**/tests keep their module-relative location; for Go, `src/somemodule/tests/test.SomeClass.ts` maps to `go/somemodule/SomeClass_test.go`.
+- Keep implementation filenames, test filenames, demos, examples, and module directories at the targets paths. Do not pick alternate paths based on preference, and do not migrate existing-equivalent paths to generated defaults.
+
+Required final response:
+- List files changed grouped by language.
+- List commands run and whether they passed.
+- List any parity limitation that could not be represented exactly.
+"""
+
+
+def run_codex(config: HarnessConfig, prompt: str, args: argparse.Namespace) -> int:
+    codex = args.codex or shutil.which("codex")
+    if not codex:
+        print("codex executable not found. Install Codex CLI or pass --codex /path/to/codex.", file=sys.stderr)
+        return 127
+
+    command = [
+        codex,
+        "-s",
+        args.sandbox,
+        "-a",
+        "never",
+        "exec",
+        "-C",
+        str(config.repo),
+        "--skip-git-repo-check",
+    ]
+    if args.model:
+        command.extend(["-m", args.model])
+    command.append("-")
+
+    print(f"running: {' '.join(command[:-1])} -", file=sys.stderr)
+    completed = subprocess.run(command, input=prompt, text=True, check=False)
+    return completed.returncode
+
+
+def snapshot(source_root: Path) -> dict[Path, tuple[int, int]]:
+    files = iter_source_files(source_root)
+    state: dict[Path, tuple[int, int]] = {}
+    for path in files:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        state[path] = (stat.st_mtime_ns, stat.st_size)
+    return state
+
+
+def changed_since(previous: dict[Path, tuple[int, int]], current: dict[Path, tuple[int, int]]) -> list[Path]:
+    changed: list[Path] = []
+    all_paths = set(previous) | set(current)
+    for path in sorted(all_paths):
+        if previous.get(path) != current.get(path) and is_source_path(path):
+            changed.append(path)
+    return changed
+
+
+def command_run(args: argparse.Namespace) -> int:
+    config = config_from_args(args)
+    if not config.targets:
+        print("no target languages selected; include at least one of python, go/golang, rust, ruby", file=sys.stderr)
+        return 2
+    if args.changed:
+        source_files = changed_source_files(config, args.changed)
+    else:
+        source_files = iter_source_files(config.source_root)
+
+    if not source_files:
+        print(f"no TypeScript source files found under {config.source_root}", file=sys.stderr)
+        return 2
+
+    prompt = build_prompt(config, source_files, mode="one-shot drift repair")
+    if args.dry_run:
+        print(prompt)
+        return 0
+    return run_codex(config, prompt, args)
+
+
+def command_watch(args: argparse.Namespace) -> int:
+    config = config_from_args(args)
+    if not config.targets:
+        print("no target languages selected; include at least one of python, go/golang, rust, ruby", file=sys.stderr)
+        return 2
+    previous = snapshot(config.source_root)
+    print(f"watching {config.source_root} for TypeScript changes")
+
+    if args.initial:
+        prompt = build_prompt(config, sorted(previous), mode="watch initial drift repair")
+        if args.dry_run:
+            print(prompt)
+        else:
+            exit_code = run_codex(config, prompt, args)
+            if exit_code != 0:
+                return exit_code
+
+    try:
+        while True:
+            time.sleep(args.interval)
+            current = snapshot(config.source_root)
+            changed = changed_since(previous, current)
+            previous = current
+            if not changed:
+                continue
+
+            time.sleep(args.debounce)
+            current = snapshot(config.source_root)
+            changed = changed_since(previous, current) or changed
+            previous = current
+
+            print(f"detected {len(changed)} changed TypeScript file(s)")
+            prompt = build_prompt(config, changed, mode="watch incremental drift repair")
+            if args.dry_run:
+                print(prompt)
+                continue
+            exit_code = run_codex(config, prompt, args)
+            if exit_code != 0 and args.stop_on_error:
+                return exit_code
+    except KeyboardInterrupt:
+        print("watch stopped")
+        return 0
+
+
+def command_map(args: argparse.Namespace) -> int:
+    config = config_from_args(args)
+    source_files = iter_source_files(config.source_root)
+    manifest = build_manifest(config, source_files)
+    if args.json:
+        print(json.dumps(manifest, indent=2))
+        return 0
+
+    for entry in manifest:
+        print(f"{entry['source_rel']} ({entry['kind']})")
+        targets = entry["targets"]
+        target_path_sources = entry["target_path_sources"]
+        assert isinstance(targets, dict)
+        assert isinstance(target_path_sources, dict)
+        for language, path in targets.items():
+            status = "exists" if Path(path).exists() else "missing"
+            source = target_path_sources.get(language, "unknown")
+            print(f"  {language:6} {path} [{status}, {source}]")
+    return 0
+
+
+def add_common_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--repo", default=str(DEFAULT_REPO), help="repository root passed to codex exec")
+    parser.add_argument("--source-root", help="TypeScript source package root; defaults to REPO")
+    parser.add_argument("--target", action="append", type=parse_target, help="target mapping: language=/path/to/root")
+    parser.add_argument("--package-name", help="target package/module name for Python and Ruby paths")
+    parser.add_argument(
+        "--languages",
+        action="append",
+        help="comma-separated language set, e.g. ts,python,golang; TypeScript is always the source",
+    )
+    parser.add_argument("--only", action="append", help="deprecated alias for --languages")
+    parser.add_argument(
+        "--agents-glob",
+        action="append",
+        help="AGENTS.md glob/path embedded in the prompt; repeat to override defaults",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="polyglot-map")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser("run", help="run one-shot drift repair")
+    add_common_options(run_parser)
+    run_parser.add_argument("--changed", action="append", help="changed TypeScript source path to scope the run")
+    run_parser.add_argument("--dry-run", action="store_true", help="print prompt without invoking Codex")
+    run_parser.add_argument("--codex", help="path to Codex CLI executable")
+    run_parser.add_argument("--model", help="Codex model override")
+    run_parser.add_argument(
+        "--sandbox",
+        default="danger-full-access",
+        choices=("read-only", "workspace-write", "danger-full-access"),
+    )
+    run_parser.set_defaults(func=command_run)
+
+    watch_parser = subparsers.add_parser("watch", help="watch TypeScript files and repair drift after changes")
+    add_common_options(watch_parser)
+    watch_parser.add_argument("--interval", type=float, default=2.0, help="poll interval in seconds")
+    watch_parser.add_argument("--debounce", type=float, default=0.75, help="settle time after a detected change")
+    watch_parser.add_argument("--initial", action="store_true", help="run a full repair once before watching")
+    watch_parser.add_argument("--stop-on-error", action="store_true", help="stop watch mode if Codex exits non-zero")
+    watch_parser.add_argument("--dry-run", action="store_true", help="print prompts without invoking Codex")
+    watch_parser.add_argument("--codex", help="path to Codex CLI executable")
+    watch_parser.add_argument("--model", help="Codex model override")
+    watch_parser.add_argument(
+        "--sandbox",
+        default="danger-full-access",
+        choices=("read-only", "workspace-write", "danger-full-access"),
+    )
+    watch_parser.set_defaults(func=command_watch)
+
+    map_parser = subparsers.add_parser("map", help="print source-to-target layout mappings")
+    add_common_options(map_parser)
+    map_parser.add_argument("--json", action="store_true", help="print JSON manifest")
+    map_parser.set_defaults(func=command_map)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args))
