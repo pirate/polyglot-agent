@@ -4,6 +4,8 @@ from tempfile import TemporaryDirectory
 
 from polyglot_map.cli import (
     Target,
+    HarnessConfig,
+    build_manifest,
     load_prompt_template,
     map_target_path,
     parse_languages,
@@ -28,6 +30,10 @@ class LayoutMappingTests(unittest.TestCase):
         self.assertIn("You are Polyglot Drift Mapper", template)
         self.assertIn("Hard invariants:", template)
         self.assertIn("Additional layout rules:", template)
+        self.assertIn("Runtime ownership beats file symmetry", template)
+        self.assertIn("The source manifest is the edit scope", template)
+        self.assertIn("implement-in-target", template)
+        self.assertIn("source-runtime-only", template)
         self.assertIn("{manifest_text}", template)
         self.assertIn("{selected_languages}", template)
 
@@ -107,6 +113,33 @@ class LayoutMappingTests(unittest.TestCase):
             self.assertEqual(path, existing)
             self.assertEqual(source, "existing-equivalent")
             self.assertEqual(default_path, root / "command.go")
+
+    def test_manifest_marks_targets_as_runtime_decision_candidates(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_root = root / "js"
+            source = source_root / "src" / "platform" / "PlatformOwnedRuntime.ts"
+            source.parent.mkdir(parents=True)
+            source.write_text("export class PlatformOwnedRuntime {}\n")
+            config = HarnessConfig(
+                repo=root,
+                source_root=source_root,
+                targets=(
+                    Target("python", root / "python", package_name="example_pkg"),
+                    Target("go", root / "go"),
+                ),
+                agent_patterns=(),
+            )
+
+            manifest = build_manifest(config, [source])
+
+            self.assertEqual(
+                manifest[0]["mapping_contract"],
+                "candidate-targets-require-runtime-ownership-decision",
+            )
+            self.assertIn("source-runtime-only", manifest[0]["allowed_mapping_decisions"])
+            self.assertEqual(manifest[0]["target_path_sources"]["python"], "generated-missing")
+            self.assertEqual(manifest[0]["target_path_sources"]["go"], "generated-missing")
 
 
 if __name__ == "__main__":

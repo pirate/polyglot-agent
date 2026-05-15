@@ -11,8 +11,10 @@ The tool does not translate code by itself. It builds a strict repair prompt, di
 - Public callable and type names preserve the TypeScript name verbatim where the target language allows it.
 - Casing transforms are category-specific: fields, locals, config keys, fixture data, JSON/event payload values, and non-callable values use `snake_case`.
 - Existing target-language files are authoritative when they already correspond to a TypeScript source file.
-- Generated paths are defaults for missing files only; the agent must not rename established files just to satisfy a different casing or package-layout preference.
-- Tests and examples are part of the mapping contract, not optional follow-up work.
+- Generated paths are candidate paths for missing files only; the agent must first prove that the target runtime owns the behavior.
+- Runtime ownership beats file symmetry. Frontend/browser, extension/service-worker, server-only, CLI/build, codegen, native platform, and other source-runtime-only TypeScript files may be intentionally unmapped in target languages that do not own that runtime.
+- Tests and examples are part of the mapping contract when they exercise target-owned behavior, not optional follow-up work.
+- Scoped runs stay scoped: unrelated validation failures should be reported, not repaired, unless they were caused by the current edits.
 
 ## Install
 
@@ -87,7 +89,16 @@ Each target path is marked with one of:
 
 - `mapped-existing`: the generated mapped path already exists.
 - `existing-equivalent`: a target-language file with an equivalent source stem already exists, so the agent must update that file in place.
-- `generated-missing`: no equivalent file exists yet, so the generated path is the creation target.
+- `generated-missing`: no equivalent file exists yet, so the generated path is a candidate creation target only if the target runtime owns that behavior.
+
+Each manifest entry also includes a `mapping_contract` and allowed mapping decisions. The invoked agent must classify the TypeScript source responsibility before editing:
+
+- `implement-in-target`: target runtime owns this behavior and needs a real implementation or update.
+- `existing-target-equivalent`: an established target file owns the behavior.
+- `source-runtime-only`: TypeScript owns behavior that runs in a runtime unavailable to the target language.
+- `generated-artifact`: parity belongs to generator/schema output or generated metadata.
+- `test-contract-only`: parity should be asserted through existing public behavior tests.
+- `unsupported-runtime-limitation`: the target runtime cannot express the behavior; report the reason without stubs.
 
 ## Defaults
 

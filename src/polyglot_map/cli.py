@@ -62,6 +62,14 @@ INITIALISM_NORMALIZATIONS = {
     "SQL": "Sql",
 }
 PROMPT_TEMPLATE_NAME = "system_prompt.md"
+MAPPING_DECISIONS = (
+    "implement-in-target",
+    "existing-target-equivalent",
+    "source-runtime-only",
+    "generated-artifact",
+    "test-contract-only",
+    "unsupported-runtime-limitation",
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -410,6 +418,8 @@ def build_manifest(config: HarnessConfig, source_files: list[Path]) -> list[dict
                 "source_rel": rel.as_posix(),
                 "source_exists": path.exists(),
                 "kind": source_kind(rel),
+                "mapping_contract": "candidate-targets-require-runtime-ownership-decision",
+                "allowed_mapping_decisions": list(MAPPING_DECISIONS),
                 "targets": target_paths,
                 "target_path_sources": target_path_sources,
                 "generated_default_targets": default_target_paths,
@@ -571,6 +581,7 @@ def command_map(args: argparse.Namespace) -> int:
 
     for entry in manifest:
         print(f"{entry['source_rel']} ({entry['kind']})")
+        print(f"  mapping  {entry['mapping_contract']}")
         targets = entry["targets"]
         target_path_sources = entry["target_path_sources"]
         assert isinstance(targets, dict)
